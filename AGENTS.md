@@ -56,7 +56,9 @@ admin dashboard (atlas-console), which employees never see.
   - **Active** — real keyboard/mouse input within the idle threshold.
   - **Passive (media)** — no input, but media is actively playing (YouTube,
     TikTok, movie, Spotify). Detected via Windows `GlobalSystemMediaTransport
-    ControlsSessionManager` (GSMTC), with audio-output (WASAPI) as a fallback.
+    ControlsSessionManager` (GSMTC), with a **gated** audio-output (WASAPI)
+    fallback — **calls (Teams/Zoom/Meet/etc.) are never counted as media**
+    (see `docs/DECISIONS.md` #7).
   - **Idle / Away** — no input AND no media.
 
 ### v2.0.0 (planned, not now)
