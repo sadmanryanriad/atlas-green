@@ -1,0 +1,23 @@
+# --- Child repos (tracked independently in their own git repos) ---
+# The mother repo only versions the docs + shared context, NOT the app code.
+/atlas-agent/
+/atlas-console/
+
+# --- OS / editor junk ---
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+*.swp
+*~
+
+# --- Editor / IDE ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- Local scratch ---
+/tmp/
+/scratch/
+*.local.md
