@@ -1,14 +1,20 @@
-# Atlas Green — API Contract (v1.1)
+# Atlas Green — API Contract (v1.2)
 
 > **This document is authoritative.** `atlas-agent` and `atlas-console` must both
 > implement it exactly. To change the contract: edit this file first, bump the
 > version, then update both sides. Never let the two implementations drift.
+> **When this file is bumped, verify both child `AGENTS.md` files still match.**
 >
-> **v1.1 (2026-06)** folds in the multi-model review: `batchId` is now a UUID with
-> a `batches` receipt collection and atomic ingest; capture-health, `sessionId`,
-> `urlCaptureMethod`, `employeeId`, and title caps are added; enrollment, config
-> ranges, clock-skew, and rate limits are specified. The URL path stays `/api/v1`
-> (no breaking change to routes).
+> **v1.1 (2026-06)** folded in the first multi-model review: UUID `batchId` +
+> `batches` receipt + atomic ingest; capture-health, `sessionId`, `urlCaptureMethod`,
+> `employeeId`, title caps; config ranges, clock-skew, rate limits.
+>
+> **v1.2 (2026-06, iteration-2 review)** corrects/clarifies: dedup uniqueness lives
+> only on `batches` (not `intervals`); enrollment **rotates** on token loss;
+> `/heartbeat` accepts a **revoked** token (→ `revoked`) and **never returns 426**;
+> device `status` becomes **liveness + flags**; `/enroll` rate limit relaxed for the
+> office NAT; `durationSec` is canonical; device timezone + `configSchemaVersion`
+> added to heartbeat; `dropped.byState`. The URL path stays `/api/v1`.
 
 - **Base URL**: `https://<console-host>/api/v1`
 - **Transport**: HTTPS only.
@@ -47,8 +53,9 @@ Content-Type: application/json
   "osUsername": "ravi",
   "os": "Windows 11 Pro 23H2",
   "agentVersion": "0.1.0",
+  "timezone": "Asia/Dhaka",                           // device IANA tz (mutable attribute)
   "machineHints": {                                   // informational only in v1 (no dedup)
-    "machineGuid": "…"                                // mac dropped in v1.1 (multi-NIC, unused)
+    "machineGuid": "…"                                // read by the SERVICE (LocalSystem); null if unavailable
   }
 }
 ```
@@ -71,19 +78,25 @@ Content-Type: application/json
 ```
 
 **Behavior**
-- Enrollment is **idempotent on `deviceId`**: a re-enroll of an already-enrolled,
-  non-revoked device returns the **existing** token (no rotation). Token rotation
-  happens only via explicit admin revocation. (This avoids orphaning buffered rows
-  tagged under an old token era.)
-- If the device is **blocked/revoked** server-side, `/enroll` returns **`403`**
-  (it must not silently un-revoke by issuing a fresh token).
+- Enrollment is **idempotent on `deviceId`**, with **token-loss recovery by
+  rotation** (v1.2): a re-enroll that **presents a valid existing token** is a no-op
+  (returns the device record, same token still valid). A re-enroll **without** a
+  valid token — the normal case after a lost/corrupted DPAPI blob — **rotates**: the
+  server marks the prior `deviceTokens` row `supersededAt` and issues a **new**
+  token. (Tokens are stored hashed, so the server cannot "return the existing" one;
+  rotation is safe because batches are keyed by `deviceId`+`batchId`, not token era,
+  so buffered rows still sync under the new token.)
+- **Auth-check order**: validate the **org key first** (`401` if invalid), **then**
+  the device block (`403` if blocked/revoked) — so a caller without a valid org key
+  can't probe block status. `/enroll` must not silently un-revoke a blocked device.
 - The server may hold **multiple active org keys** (rotation with a transition
-  window); any currently-valid key is accepted. Invalid/missing org key → `401`.
+  window); any currently-valid key is accepted.
 - **Config validation**: the agent **clamps/ignores** out-of-range config values
   (keeps the previous value, logs a warning). The ranges above are authoritative.
 
 **Errors**: `401` (bad org key / token-device mismatch), `403` (blocked device),
-`400` (malformed), `426` (contract mismatch), `429` (rate limit), `5xx`.
+`400` (malformed), `426` (contract mismatch on enroll/ingest only), `429` (rate
+limit), `5xx`.
 
 ---
 
@@ -136,21 +149,28 @@ Content-Encoding: gzip
 ```
 
 **Behavior**
-- **Atomic per batch.** The server records the `batchId` in a **`batches` receipt
-  collection** and inserts all intervals in **one MongoDB transaction** — all or
-  nothing. There is no partial accept.
-- **Idempotent on `{deviceId, batchId}`** (strict unique index). A retry of an
-  already-received batch returns the original `accepted` count with
-  `duplicate: true`, without re-inserting. The `batches` collection is **retained
-  independently** of `intervals`, so a stale offline replay of a batch whose
-  intervals an admin already deleted is **rejected as a duplicate**, not resurrected.
+- **Atomic per batch.** The server writes the `batchId` receipt into the **`batches`
+  collection** and inserts all intervals in **one MongoDB transaction** (≤ 1000
+  intervals/txn) — all or nothing. There is no partial accept.
+- **Idempotency uniqueness lives on `batches` only** (`{deviceId, batchId}` unique).
+  On `intervals` it is a **non-unique** index — every interval in a batch shares the
+  same `batchId`, so a unique index there would reject all but the first. A retry of
+  an already-received batch returns the original `accepted` with `duplicate: true`,
+  re-inserting nothing. The `batches` collection is **retained independently** of
+  `intervals` (with a TTL ~180 d), so a stale replay of a batch whose intervals an
+  admin already deleted is **rejected as a duplicate**, not resurrected.
+- `durationSec` (from the agent's monotonic clock) is the **canonical** duration;
+  consumers must **not** derive duration from `endUtc − startUtc` (they can differ
+  after a clock correction). Server logs a warning if they diverge by > 5 s.
 - The agent verifies the response `batchId` matches, then marks rows `synced` and
   purges — **only** after a 200 with a count.
 - The server resolves each interval's **`category`** (admin rules) **and**
   **`employeeId`** (current device→employee mapping) at ingest and stores both.
-- **`413`**: the agent splits into sub-batches, **each with its own fresh UUID**
-  `batchId`, and retries them independently. Hard cap: ≤ 5000 intervals or ≤ 5 MB
-  decompressed per batch.
+- **Size cap ≤ 5000 intervals / ≤ 5 MB decompressed.** The agent **self-splits
+  before sending** when over the cap (fresh UUID per sub-batch); `413` is the
+  fallback if the server still rejects, and a sub-batch that still `413`s is split
+  again (recursive halving). Sub-batches obey the same rate limit (don't fire them
+  all at once).
 
 **Errors**: `401` (bad/revoked token, or token↔deviceId mismatch), `400`
 (malformed/bad gzip / `durationSec` out of bounds), `413` (batch too large —
@@ -179,26 +199,34 @@ Authorization: Bearer <device token>
   "lastSyncUtc": "2026-06-22T09:10:06.000Z",
   "health": { "cpuPct": 0.4, "memMb": 38 },
   "capture": {                      // proves the HELPER (not just the service) is alive
-    "helperRunning": true,
+    "helperRunning": true,          // service's view: pipe connected + recent sample
     "lastSampleUtc": "2026-06-22T09:14:58.000Z",
+    "helperStartedAtUtc": "2026-06-22T09:00:11.000Z",
     "helperRestartCount": 0
   },
   "dropped": {                      // present only when the buffer cap forced a drop
-    "count": 0,
-    "oldestUtc": null,
-    "newestUtc": null
+    "count": 0, "oldestUtc": null, "newestUtc": null,
+    "byState": { "active": 0, "passive_media": 0, "idle": 0 }
   },
   "updateStatus": "idle",           // "idle"|"downloading"|"verifying"|"success"|"failed"
-  "attributes": {                   // sent only when a mutable attribute changed
-    "pcName": "PC-07", "hostname": "DESK-RAVI", "osUsername": "ravi"
+  "attributes": {                   // sent on first heartbeat + when a value changed
+    "pcName": "PC-07", "hostname": "DESK-RAVI", "osUsername": "ravi",
+    "timezone": "Asia/Dhaka", "machineGuid": "…"   // tz + machineGuid for clone detection
   }
 }
 ```
+> First heartbeat after enrollment or restart sends `attributes`/`os` unconditionally;
+> thereafter only when a value differs from the last sent (persisted in an
+> `agent_state` row so a restart isn't treated as a baseline reset).
 
 **Response 200**
 ```jsonc
 {
   "serverTimeUtc": "2026-06-22T09:15:00.000Z",
+  "liveness": "online",             // device liveness (server-owned)
+  "flags": [],                      // e.g. ["outdated","clock_skewed","revoked"]
+  "reauthorized": false,            // true once after an admin un-revoke → agent resumes capture
+  "contractDeprecated": false,      // true if the agent's contract major is being phased out
   "config": {                       // same shape as /enroll (all remotely-tunable fields)
     "configSchemaVersion": 1,
     "sampleIntervalSec": 4, "idleThresholdSec": 300, "syncIntervalSec": 300,
@@ -213,16 +241,31 @@ Authorization: Bearer <device token>
 ```
 
 **Behavior**
-- Server updates the device's `lastSeenAt` and `status` (see the device status
-  state machine in `ARCHITECTURE.md` §7). Devices not seen within
-  `heartbeatIntervalSec × 3` (default 15 min) are shown **offline**.
-- The server surfaces `capture.helperRunning == false` / stale `lastSampleUtc`
-  (helper dead though service online), a non-zero `dropped` (data gap), and
-  `updateStatus == failed` in the dashboard heartbeat panel.
-- Server applies mutable `attributes` to the device doc (identity is unchanged).
-- The agent applies returned `config` changes; **out-of-range values are ignored**
-  (see §1 ranges). It computes `clockOffset = serverTimeUtc − localUtc` and flags a
-  skew (see §5). On a heartbeat failure it **retries once after ~30 s**, else waits
+- `/heartbeat` **always returns `200`** (it is the recovery lifeline) — including for
+  a **revoked** token (response carries `flags:["revoked"]`; the agent stops
+  capturing, keeps its buffer) and including across a major contract bump (`426` is
+  for `/enroll` and `/ingest` only; here set `contractDeprecated:true`). A token↔
+  deviceId mismatch is still `401`; a valid token whose **device doc was deleted** →
+  `404`, and the agent re-enrolls.
+- Server sets `liveness` (`online`; `offline` after `heartbeatIntervalSec × 3`,
+  default 15 min) and `flags` (`outdated`/`clock_skewed`/`revoked`/`archived`/
+  `health_warning`) — see `ARCHITECTURE.md` §7. The helper is "down"
+  (`helperRunning:false`) when no sample has arrived for ~60 s; `helperRestartCount`
+  spikes raise a tamper indicator.
+- The server **persists** a non-zero `dropped` as a `dataGap` record (so the gap
+  stays visible historically) and surfaces `helperRunning:false`/stale
+  `lastSampleUtc` and `updateStatus:"failed"` in the heartbeat panel.
+- Server applies mutable `attributes` to the device doc (identity unchanged);
+  `pcName` is **admin-owned** (the agent's reported `pcName` is logged, not stored —
+  admins rename from the dashboard), while `hostname`/`osUsername`/`timezone`/
+  `machineGuid` are agent-owned. Multiple distinct `machineGuid`s on one `deviceId`
+  → a `possible_clone` flag.
+- On `reauthorized:true` the agent exits its revoked state and resumes (re-enrolls
+  for a fresh token/config). The agent applies returned `config`; **out-of-range
+  values are ignored** (see §1); a `configSchemaVersion` newer than it supports →
+  ignore-unknown + log. It computes `clockOffset = serverTimeUtc − localUtc` and
+  flags a skew (see §5). On a heartbeat failure it **retries once after ~30 s**, else
+  waits
   for the next cycle.
 
 ---
@@ -257,11 +300,20 @@ removed in v1.1 to avoid two sources of truth.)
   **HTTP Range/resume** support (Bangladesh links are flaky and the package is
   ~60–80 MB), verifies the package **signature + SHA-256**, then swaps and restarts.
   The public key is **compiled into the agent binary**, never fetched.
-- A failed verification aborts the update (the agent keeps running the current
-  version) and is reported via `updateStatus: "failed"` on the next heartbeat.
-- Below `minSupportedVersion`: the server still **accepts ingest** (never lose data)
-  but marks the device `outdated` so IT can intervene. `latestVersion < current` is
-  a valid **downgrade** signal (emergency rollback), handled like any other update.
+- **Swap is crash-safe**: download to a staging dir, write a `pending-update` marker,
+  rename on service `OnStop`. **On every startup** the service checks the marker and,
+  if the staged package still verifies, completes the rename before the main loop;
+  otherwise it clears the marker and reports `updateStatus:"failed"`.
+- `mandatory:true` means update **as soon as possible** (next heartbeat cycle, not
+  the regular poll). On repeated failure the agent reports `updateStatus:"failed"`
+  and **keeps running the current version** — it never shuts off ingest (never lose
+  data). `agentVersion` comparison uses **semver** on `AssemblyInformationalVersion`.
+- A failed verification aborts the update (keeps the current version), reported via
+  `updateStatus:"failed"`.
+- Below `minSupportedVersion`: the server still **accepts ingest** but flags the
+  device `outdated`. `latestVersion < current` is a valid **downgrade** (emergency
+  rollback). **R2 retains the last 5 versions** (+ each signed manifest) so a
+  downgrade target is never 404; CI enforces this.
 
 ---
 
@@ -269,18 +321,19 @@ removed in v1.1 to avoid two sources of truth.)
 
 - **Versioning**: the path carries the major version (`/api/v1`). Breaking changes
   → `/api/v2`; the agent sends `X-Atlas-Contract` and the server returns `426` on a
-  major mismatch (the agent then surfaces it via heartbeat and relies on
-  auto-update to recover).
+  major mismatch **for `/enroll` and `/ingest` only** — **`/heartbeat` always 200**
+  (with `contractDeprecated:true` + the `update` block) so any agent can self-update.
 - **Clock skew**: the agent stamps timestamps from its own UTC clock and **never
-  rewrites already-buffered timestamps**, but it measures interval *durations* from
-  a **monotonic clock** (so a wall-clock jump can't produce negative/inflated
-  durations). It computes `clockOffset = serverTimeUtc − localUtc` each heartbeat;
-  if `|offset| > 5 min` it logs a warning, and if it's large and stable across two
-  heartbeats the device is flagged `clock_skewed` (the dashboard can apply the
-  stored offset at display time). Buffered raw data stays untouched.
+  rewrites already-buffered timestamps**, but `durationSec` comes from a **monotonic
+  clock** and is **canonical** (don't derive duration from `endUtc − startUtc`). It
+  computes `clockOffset = serverTimeUtc − localUtc` each heartbeat; if `|offset| >
+  5 min` it logs a warning, and if large+stable across two heartbeats the device is
+  flagged `clock_skewed`. The stored offset is applied at **both display and
+  day-bucketing**; buffered raw data stays untouched.
 - **Rate limits** (server-enforced, per device unless noted): `/ingest` ≤ 1 / 30 s,
-  `/heartbeat` ≤ 1 / 60 s, `/enroll` ≤ 1 / hour / IP; global ≤ ~200 req/s / IP.
-  Over-limit → `429` with `Retry-After`, which the agent honors.
+  `/heartbeat` ≤ 1 / 60 s, `/enroll` ≤ **10 / min / IP** (a corp-CIDR allowlist in
+  `settings` is exempt, so the manual 100-PC rollout behind one office NAT isn't
+  throttled); global ≤ ~200 req/s / IP. Over-limit → `429` with `Retry-After`.
 - **Payload size**: keep ingest batches under the hard cap (≤ 5000 intervals or
   ≤ 5 MB decompressed). If `413`, split into fresh-UUID sub-batches and retry.
 - **Backoff & jitter**: failed sync retries use exponential backoff **with ±jitter**

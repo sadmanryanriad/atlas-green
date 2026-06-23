@@ -73,11 +73,16 @@ reports to the service. All buffering, auth, and uploading live in the service.
 A Session-0 service cannot `CreateProcess` straight onto the interactive desktop.
 The mechanism (locked, Decision #32):
 
-- The service runs as **LocalSystem** (it needs `SE_TCB` to use a user token).
+- The service runs as **LocalSystem** (it needs `SE_TCB` to use a user token). **It
+  must stay LocalSystem** — the device token and buffer key are DPAPI machine-scope
+  blobs that only LocalSystem can decrypt; switching to a least-privilege account
+  would brick the token and lose the buffer (no migration path in v1).
 - It calls **`WTSGetActiveConsoleSessionId`** → **`WTSQueryUserToken`** →
-  **`CreateProcessAsUser`** with that token, so the helper runs **as the logged-on
-  user** (not SYSTEM — UIPI/integrity would otherwise block UIA reads of the
-  browser).
+  **`CreateProcessAsUser`** (with `lpDesktop = "Winsta0\\Default"`,
+  `CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT`, and the user's environment block)
+  so the helper runs **windowless, as the logged-on user** (not SYSTEM — UIPI would
+  otherwise block UIA reads). It launches the helper **only when a real user token
+  exists** — not at the logon/lock screen (Session-0 / logon-UI token).
 - It registers for **`WTS_SESSION_CHANGE`** (`WTSRegisterSessionNotification`) and
   relaunches/tears down the helper on logon/logoff and **fast user switching**.
 - **v1 monitors the console (physical) session only.** RDP sessions are ignored
@@ -90,10 +95,14 @@ The mechanism (locked, Decision #32):
 
 One-way **helper → service** over a local named pipe, **length-prefixed JSON**
 (4-byte little-endian length header + UTF-8 JSON body), max 64 KB/message. The pipe
-has a security descriptor restricting it to **LocalSystem + the interactive user**
-(so no other process can inject fake samples). The helper auto-reconnects with ~1 s
-backoff if the pipe drops; each sample carries a monotonic seq so the service can
-drop a duplicate on reconnect.
+has a security descriptor restricting it to **LocalSystem + the interactive user**.
+Because the user is an allowed pipe client, the service **verifies the peer** on
+connect — `GetNamedPipeClientProcessId` → `QueryFullProcessImageName` → confirm it's
+the installed helper exe and **code-signed by the agent cert** — and rejects anything
+else (a standard user can otherwise connect and inject fake samples). On connect the
+helper sends a **per-instance UUID** handshake; the service dedupes samples by
+`(instanceId, seq)`, so a seq reset after a helper restart can't falsely drop the
+first post-restart samples. The helper auto-reconnects with ~1 s backoff.
 
 ---
 
@@ -109,8 +118,12 @@ drop a duplicate on reconnect.
    any window in a different session), keeping the last real app for their duration.
 3. Service appends the closed interval to the **SQLite buffer** (`synced = 0`).
    Open-interval **duration is measured from a monotonic clock**; `startUtc`/`endUtc`
-   are wall-clock UTC. On **sleep/suspend** the open interval is closed at the
-   suspend time; a new `idle` interval starts on resume.
+   are wall-clock UTC. On **sleep/suspend** (the service's `SERVICE_CONTROL_POWEREVENT`
+   handler, debounced for sub-30 s blips) the open interval is closed at the suspend
+   time; on **resume the new interval's state is re-derived from the next sample**
+   (it may be `passive_media` if media auto-resumed — not presumed `idle`). A
+   monotonic sanity check force-closes any open interval whose elapsed time exceeds
+   the idle threshold ×3, in case a power event is missed (VM / Modern Standby).
 4. Every **5 min** (±30 s jitter), the sync loop gathers unsynced rows, gzips them
    as one JSON batch with a **UUID `batchId`**, and `POST`s to `/api/v1/ingest`.
 5. On HTTP 200 + ACK (with a matching `batchId`), the service marks those rows
@@ -135,16 +148,20 @@ Each interval carries exactly one **state**:
 
 **Calls are not media.** Raw audio output also fires on Teams/Zoom/Meet/Discord/
 Slack calls, notification dings, and screen-reader TTS. The WASAPI fallback is
-therefore **gated**: it only yields `passive_media` when the active/most-recent
-GSMTC media source is a non-communications app (Decision #7). A user on a silent
-call is `idle` until they provide input; a user actively on a call (input within
-threshold) is `active`. Misclassifying a 3-hour client call as "passive media"
-would be both wrong and damaging.
+therefore **gated**: it only yields `passive_media` when a **recent (≤60 s)** active
+GSMTC source is a **non-communications** app (Decision #7). An **active comms call
+overrides** — even if Spotify is also playing, a user on a Teams call is never
+`passive_media` (they're `active` if inputting, else `idle`). A user on a silent
+call is `idle` until they provide input. Misclassifying a 3-hour client call as
+"passive media" would be both wrong and damaging.
 
-**Hysteresis** (Decision #34): the state machine enters `idle` at 300 s of no input
-but **leaves `idle` only after ~30 s of sustained input**, and sub-~5 s intervals
-are merged. Without this, a single input near the threshold oscillates the state
-every sample and flushes constantly — defeating Model B's "rare flush" benefit.
+**Hysteresis** (Decision #34): the machine enters `idle` only after **300 s of
+continuous no-input** — any input **resets** the 300 s timer, which is what stops the
+boundary oscillation — and **leaves `idle` on any input** (→ `active`). Hysteresis
+governs only the input-driven `idle ↔ active` boundary; **media transitions are
+immediate** (`idle → passive_media` the moment media is detected, no wait). Sub-~5 s
+intervals are merged, resolving a "presumed-then-sampled" conflict in favor of the
+sampled state.
 
 Idle **splits** an interval: if the user is active on an app and then goes idle on
 the same app, that produces an `active` interval followed by an `idle` interval, so
@@ -191,7 +208,12 @@ with the game's process name. AFK-in-game (no input, no media) → `idle`. Hones
   dashboard is never deployed open. (The agent API routes keep their Bearer-token
   auth; this is the *human* access layer that was missing.)
 - **Rate limiting**: the server throttles `/ingest`, `/heartbeat`, and `/enroll`
-  per device/IP (see API-CONTRACT §5) so a buggy or rogue agent can't flood it.
+  per device/IP (see API-CONTRACT §5) so a buggy or rogue agent can't flood it
+  (`/enroll` exempts a corp-CIDR allowlist so the manual rollout isn't blocked).
+- **Revoked devices stay visible, not dark**: a revoked token is rejected on
+  `/ingest`/`/enroll` but **accepted on `/heartbeat`** (→ `flags:[revoked]`), so the
+  machine shows as `revoked` rather than silently "offline"; an admin un-revoke sets
+  `reauthorized` on the next heartbeat and the agent self-heals.
 - **Both org-key and the manifest can be compromised at the edge**, so: the org key
   is **rotatable** (an array of active keys with expiry); a **blocked device is
   refused at `/enroll`**; and the **manifest is signed** (verified before the agent
@@ -213,43 +235,61 @@ with the game's process name. AFK-in-game (no input, no media) → `idle`. Hones
 > Indicative shapes; the implementing repo owns exact schemas/validation. All
 > timestamps are stored in **UTC**.
 
-- **devices**: `{ _id: deviceId, pcName, hostname, osUsername, employeeId?,
-  agentVersion, os, status, lastSeenAt, lastSampleUtc, helperRunning,
-  clockOffsetMs?, enrolledAt, blocked: bool, archived: bool, machineHints:
-  { machineGuid }, config }`
-  - **`status` is an explicit server-owned state machine** (Decision #39):
-    `pending` (enrolled, no intervals yet) → `online`/`offline` (driven by
-    `lastSeenAt` vs `heartbeatIntervalSec × 3`), plus `outdated` (< `minSupportedVersion`),
-    `clock_skewed`, `revoked`, `archived`. The dashboard reads **only** `status`,
-    never re-derives it from `archived`/`revokedAt`/`lastSeenAt` separately.
+- **devices**: `{ _id: deviceId, pcName, hostname, osUsername, timezone, employeeId?,
+  agentVersion, os, liveness, flags, lastSeenAt, lastSampleUtc, helperRunning,
+  helperStartedAtUtc, clockOffsetMs?, lastDropped?, enrolledAt, blocked: bool,
+  archived: bool, machineHints: { machineGuid }, config }`
+  - **State = liveness + flags** (Decision #39, server-owned). `liveness`: `pending`
+    (enrolled, no intervals yet) → `online`/`offline` (driven by `lastSeenAt` vs
+    `heartbeatIntervalSec × 3`). Independent `flags` (any combination): `outdated`
+    (< `minSupportedVersion`), `clock_skewed`, `revoked`, `archived`,
+    `health_warning` (cpu > 5% sustained or mem > 200 MB), `possible_clone`. The
+    dashboard reads `liveness` for the badge and renders `flags` as chips — it never
+    re-derives them from `lastSeenAt`/`revokedAt` separately.
 - **intervals**: `{ _id, deviceId, employeeId, sessionId, startUtc, endUtc,
   durationSec, state, appName, processName, windowTitle, browser?, domain?,
   pageTitle?, urlCaptureMethod, osUsername, category, batchId, receivedAt }`
-  - `employeeId` and `osUsername` are **snapshots at ingest/capture** — never
-    back-filled; the current values live on `devices`. `receivedAt` is **server-set**.
-  - Indexes: `{ deviceId, startUtc }`, **`{ employeeId, startUtc }`** (the hot
-    dashboard query), **`{ deviceId, batchId }` unique**, `{ domain }`,
-    `{ category }`.
-- **batches** (receipt; retained independently of `intervals` — Decision #28):
-  `{ _id: batchId, deviceId, accepted, receivedAt }`, unique on `{ deviceId,
-  batchId }`. Ingest checks this first; an admin deleting a device's intervals
-  **never** deletes its batch receipts, so a stale replay can't resurrect data.
+  - `osUsername` is a **capture-time snapshot, never back-filled**. `employeeId` is
+    resolved at ingest but **re-resolvable** (admin remap → future intervals + an
+    optional audit-logged bulk reassign of a historical range). `durationSec` is
+    canonical (not `endUtc − startUtc`). `receivedAt` is **server-set**, equal to the
+    batch's `receivedAt` (one commit-time stamp).
+  - Indexes: `{ deviceId, startUtc }`, **`{ employeeId, startUtc }`** (hot query),
+    **`{ deviceId, batchId }` NON-unique** (find/delete-by-batch — uniqueness lives on
+    `batches`, never here, or every multi-interval batch would be rejected),
+    `{ domain }`, `{ category }`.
+- **batches** (receipt; Decision #28): `{ _id: batchId, deviceId, accepted,
+  receivedAt }`, **unique on `{ deviceId, batchId }`** (the dedup serialization
+  point), **TTL index on `receivedAt` (~180 d)** so it can't grow unbounded; a
+  receipt can't outlive the agent's max buffer hold anyway. Ingest checks this first;
+  ordinary interval delete **never** touches receipts (no stale-replay resurrection),
+  but the **"forget device"** admin action deletes intervals **and** receipts.
 - **categories**: `{ _id, pattern, matchType: 'exact'|'domain'|'process',
   priority, category: 'productive'|'unproductive'|'neutral', updatedBy, updatedAt }`
   - **Precedence** (deterministic): `exact` > `domain` > `process`, then higher
     `priority`; unmatched defaults to `neutral`.
-- **employees**: `{ _id, name, email?, department?, deviceIds: [] }`
-- **deviceTokens**: `{ _id, deviceId, tokenHash, createdAt, revokedAt? }` — unique
-  index on `tokenHash` (every ingest/heartbeat looks up by it).
+- **employees**: `{ _id, name, email?, department?, tzOverride?, deviceIds: [] }`
+  (`tzOverride` = optional IANA tz for a non-Dhaka hire's day-bucketing).
+- **deviceTokens**: `{ _id, deviceId, tokenHash, createdAt, revokedAt?,
+  supersededAt? }` — unique index on `tokenHash`. Token-loss re-enroll supersedes the
+  old row and mints a new one (Decision #43).
+- **dataGaps**: `{ _id, deviceId, count, byState, oldestUtc, newestUtc, detectedAt }`
+  — persisted from a heartbeat `dropped` block so a buffer-overflow gap stays visible
+  on the timeline after the heartbeat passes.
 - **settings** (document-per-key so updates are atomic):
-  - `orgKeys: [{ keyId, valueHash, createdAt, expiresAt, revokedAt? }]` (rotation)
+  - `orgKeys: [{ keyId, valueHash, createdAt, expiresAt, revokedAt? }]` — expired +
+    revoked keys pruned ~90 d after revocation.
   - `agentDefaults: { sampleIntervalSec, idleThresholdSec, … }`
-  - `rateLimits: { ingestPerDevice, heartbeatPerDevice, enrollPerIp }`
-  - `retention: { intervalDays: null, screenshotDays: 7 }`
-  - `orgTimeZone: "Asia/Dhaka"` (used for day/week bucketing — Decision #40)
+  - `rateLimits: { ingestPerDevice, heartbeatPerDevice, enrollPerIp, enrollAllowlistCidrs: [] }`
+  - `retention: { intervalDays: null, batchReceiptDays: 180, screenshotDays: 7 }`
+  - `orgTimeZone: "Asia/Dhaka"` — **validated against the IANA db** before save;
+    changes are audit-logged + stamped `orgTimeZoneChangedAt` and affect future
+    bucketing only.
 - **auditLog**: `{ _id, adminId, action, target, before?, after?, atUtc }` — every
   destructive/rules-changing admin action (revoke, archive, delete, category edit,
-  device→employee remap). Planned for Phase 4.
+  device→employee remap, `orgTimeZone` change). Infra + write helper land in **Phase
+  0** (the mapping action ships then); the viewer is Phase 4. `adminId` = the
+  Cloudflare-Access email until Phase 4 NextAuth assigns a stable UUID.
 
 Categorization and `employeeId` are resolved at ingest (stored for fast queries)
 **and** bulk-re-resolvable when rules/mappings change (no re-ingest needed).
@@ -262,18 +302,24 @@ Categorization and `employeeId` are resolved at ingest (stored for fast queries)
   **dashboard UI** admins use. At ~100 agents the load is ~0.3 req/s — trivial.
 - **Cloudflare** provides TLS, WAF, DDoS protection, **and Cloudflare Access** (the
   admin auth layer); a `middleware.ts` backstops it (see §6).
-- **MongoDB** (single-node **replica set**, so transactions work) is the store; the
-  dashboard queries aggregations (time per app/domain/category/state per employee
-  per day/week). Every aggregation query is **date-bounded** and uses the
-  `{employeeId|deviceId, startUtc}` indexes. If these slow as data grows, add a
-  pre-aggregated `dailySummary` collection (deferred — see DECISIONS).
-- **Time**: stored **UTC**. **Day/week bucketing** uses the fixed **org timezone**
-  (`Asia/Dhaka`); **timeline rendering** uses the **viewer's** local zone, converted
-  **client-side** (`Intl…resolvedOptions().timeZone`) to avoid SSR/CSR mismatch.
-- **`GET /api/v1/health`** checks MongoDB connectivity; an external uptime monitor
-  (e.g. UptimeRobot) watches it — nothing else watches the console itself.
-- **DB backups**: a daily `mongodump` to R2 with a documented restore test (the data
-  is irreplaceable and retention is indefinite).
+- **MongoDB** is a **single-node replica set** (so transactions work) bootstrapped
+  with `rs.initiate()` bound to **`127.0.0.1`** (binding to a hostname the driver
+  can't resolve from `localhost` is the classic "not primary" failure); connection
+  string `…?replicaSet=rs0`. A deterministic init script + dev `docker-compose` ships
+  in Phase 0. Aggregations are **date-bounded** on `{employeeId|deviceId, startUtc}`;
+  add a pre-aggregated `dailySummary` later if they slow (deferred).
+- **Time**: stored **UTC**. **Day/week bucketing** uses `settings.orgTimeZone`
+  (`Asia/Dhaka`, or `employees.tzOverride` for a non-Dhaka hire), with the device's
+  `clockOffsetMs` applied **before** the day boundary is computed. **Timeline
+  rendering** uses the **viewer's** local zone, converted **client-side**
+  (`Intl…resolvedOptions().timeZone`). Summary bucket ids are returned as org-tz date
+  strings (`bucketDate` + `bucketTimeZone`) and are **not** client-converted, so the
+  summary and the timeline don't disagree.
+- **`GET /api/v1/health`** checks MongoDB connectivity (and replica-set status); an
+  external uptime monitor (e.g. UptimeRobot) watches it.
+- **DB backups**: a daily `mongodump` to R2 with a documented, **rehearsed** restore
+  procedure (restore data → `rs.initiate()` on the fresh node → transactions resume);
+  a VPS loss costs ≤ 24 h while agents buffer locally.
 
 ### Dashboard views (v1)
 - Per-employee **daily timeline** (state-colored strip).
@@ -291,7 +337,8 @@ Deferred: alerts, departments/org chart, PDF/CSV export.
 
 - CI (GitHub Actions, Windows runner) builds + tests + publishes the agent on
   release: `dotnet publish` (self-contained single-file) → WiX MSI → **sign the
-  package and the manifest** → upload to **R2** → update **manifest.json**.
+  package and the manifest** → upload to **R2** (which **retains the last 5 versions**
+  so a downgrade target is never 404) → update **manifest.json**.
 - Agent polls the **manifest** (piggybacked on heartbeat), and if a newer version
   exists: **verify manifest signature → download from R2 with HTTP Range/resume →
   verify package signature + SHA-256 → swap → restart**. The embedded public key is
@@ -299,10 +346,15 @@ Deferred: alerts, departments/org chart, PDF/CSV export.
 - **Binary swap mechanics** (a running `.exe` can't overwrite itself): download to
   `…\AtlasGreen\update\`, write a `pending-update` marker, then on service
   `OnStop` (or via a tiny bootstrap) rename old→`.bak`, new→in place, and let SCM
-  auto-restart launch the new binary. No reboot required; abort safely on any
-  failure (keep running the current version, report `updateStatus: failed`).
+  auto-restart launch the new binary. **On every startup** the service checks the
+  marker and finishes a stranded swap (if the staged package still verifies) before
+  the main loop — so a crash mid-update self-heals. No reboot required; abort safely
+  on any failure (keep the current version, report `updateStatus: failed`).
+- The **MSI upgrade/repair preserves `C:\ProgramData\AtlasGreen`** (DeviceId, DPAPI
+  blobs, buffer) — only a full uninstall removes it — so an update never forks
+  identity or loses the buffer.
 - A new agent version may add config fields; the agent honors `configSchemaVersion`
-  (ignore-unknown for forward-compat) so a v1.1 agent against a v1.0 config doesn't
-  break.
+  (ignore-unknown for forward-compat) so a newer-config agent doesn't break.
 - First install is a manual MSI walk to ~100 PCs (IT pre-trusts the signing cert via
-  GPO first); every update after is remote.
+  GPO on AD machines, or PowerShell/MSI custom action on workgroup PCs); every update
+  after is remote.

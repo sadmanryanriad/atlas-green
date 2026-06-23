@@ -32,19 +32,28 @@ pipe end-to-end before building real features.
       heartbeats. Validates the publish pipeline before any real logic. *(was Ph5)*
 - [ ] **A** Minimal **SQLite** skeleton (create DB, one table, insert/read a row) to
       validate the library + migration approach early.
-- [ ] **C** Next.js app scaffolded; connects to **MongoDB** initialized as a
-      **single-node replica set** (`rs.initiate()`, needed for transactions later).
-- [ ] **C** `/api/v1/enroll` and `/api/v1/heartbeat` implemented per the contract.
+- [ ] **A** Prod logs go to an **ACL-locked** `C:\ProgramData\AtlasGreen\logs\` (not
+      user-readable — titles/process names aren't secrets but are sensitive).
+- [ ] **C** Next.js app scaffolded; **MongoDB single-node replica set** via a
+      deterministic init script + dev `docker-compose` (`--replSet rs0`,
+      `rs.initiate()` bound to **`127.0.0.1`**, conn string `…?replicaSet=rs0`).
+- [ ] **C** `/api/v1/enroll`, `/api/v1/heartbeat`, **`/api/v1/health`** per contract.
 - [ ] **C** **`settings` collection schema** seeded (orgKeys array, agentDefaults,
-      rateLimits, retention, orgTimeZone).
-- [ ] **C** **Admin auth from day one**: Cloudflare Access in front + a
-      `middleware.ts` that rejects unauthenticated `/dashboard/*`. *(was unplanned)*
+      rateLimits incl. `enrollAllowlistCidrs`, retention, **IANA-validated** orgTimeZone).
+- [ ] **C** **Admin auth from day one**: Cloudflare Access + a `middleware.ts` that
+      rejects unauthenticated `/dashboard/*`, with a **dev bypass** behind an env flag
+      (`DEV_AUTH_BYPASS=…`, never in prod). *(was unplanned)*
+- [ ] **C** **`auditLog` collection + write helper** (infra only); the device→employee
+      mapping action writes an audit entry from day one. Viewer is Phase 4. *(r2: minimax H3)*
 - [ ] **C** Minimal dashboard page lists devices with **online/offline + last-seen**.
 - [ ] **C** Device → employee mapping stub (assign a name to a device).
-- [ ] **C** **Dev seed script** (3 sample devices, one with 24 h of synthetic
-      intervals across all 3 states) so the dashboard is built against real-shaped
-      data, not an empty DB.
-- [ ] **A+C** Unit-test scaffolding wired (`dotnet test` / `vitest`) and green.
+- [ ] **C** **Dev org key + secrets**: seed script creates one dev org key; the agent
+      reads it from an env var / local dev config (never committed).
+- [ ] **C** **Dev seed script** (fixed-seed: 3 devices, one with 24 h of intervals —
+      all 3 states, 5+ domains incl. `null`, an interval crossing the Dhaka 18:00-UTC
+      midnight, one >4 h, one <10 s) so the dashboard is built against real shapes.
+- [ ] **A+C** Test scaffolding wired **with one real smoke test each** (`[Fact]` /
+      `it()` that runs and passes — "0 tests" is not a green toolchain).
 - [ ] **M** READMEs updated with "how to run in dev" for both repos.
 
 **Exit gate:** `dotnet run` (agent) enrolls and heartbeats against `npm run dev`
@@ -56,44 +65,55 @@ published single-file `.exe` runs on a clean VM.
 
 ## Phase 1 — Core capture (local only)  ← *Opencode*
 
-**Goal:** the agent accurately produces aggregated activity **intervals** locally
-(logged/inspected), with the correct three-state model. No server changes.
+**Goal:** the agent accurately produces aggregated activity **intervals** locally,
+with the correct three-state model. No server changes. **Split into 1a/1b** (the
+heaviest, riskiest phase) so Phase 2's SQLite/schema work can start against 1a's
+basic intervals while 1b is in progress.
+
+### Phase 1a — Helper + transport + foreground sampling
 
 - [ ] **A** User-session **helper** launched from the service via **`WTSQueryUser
-      Token` + `CreateProcessAsUser`** (service as **LocalSystem**, helper as the
-      user); reacts to **`WTS_SESSION_CHANGE`** (logon/logoff, fast user switch);
-      **console session only**, RDP ignored. Watchdog restarts a dead helper. *(core
-      correctness — was deferred to Ph7)*
-- [ ] **A** Helper runs **windowless** in prod config (no console window); verified
-      on a non-admin account. *(continuous silent invariant from here on)*
+      Token` + `CreateProcessAsUser`** (service **LocalSystem**, helper as the user,
+      `lpDesktop="Winsta0\\Default"`, `CREATE_NO_WINDOW`); launched **only for a real
+      user token** (not the logon/lock screen); reacts to **`WTS_SESSION_CHANGE`**;
+      **console session only**, RDP ignored. Watchdog restarts a dead helper.
+- [ ] **A** Helper runs **windowless** in prod config; verified on a non-admin account.
 - [ ] **A** Foreground **window + process** sampling every 3–5 s; **ignore foreground
       hijackers** (`Consent.exe`/UAC, `LogonUI`, elevated `TaskMgr`, `WerFault`).
 - [ ] **A** **`appName` from the exe `FileDescription`** (fallback = exe name); each
       interval tagged with the Windows **`sessionId`**.
-- [ ] **A** **Idle** detection via `GetLastInputInfo` (5-min threshold) **with
-      hysteresis** (leave idle only after ~30 s sustained input).
-- [ ] **A** **Media** detection via **GSMTC** (Playing?) → `passive_media`; **gated
-      WASAPI fallback** (audio counts only when the active GSMTC source is a
-      **non-communications** app — calls are never `passive_media`).
+- [ ] **A** Helper → service **length-prefixed JSON named pipe**; service **verifies
+      the peer** (PID → image path → signature) and dedupes by **`(instanceId, seq)`**
+      from a connect handshake (so a helper restart can't drop the first samples).
+- [ ] **A** Heartbeat carries **capture health** (`helperRunning`, `lastSampleUtc`,
+      `helperStartedAtUtc`, `helperRestartCount`).
+
+**1a exit gate:** the helper launches into a real user session (verified non-admin),
+relaunches on a fast user switch, and foreground samples reach the service over the
+verified pipe — visible in logs. *(Phase 2 may now begin in parallel.)*
+
+### Phase 1b — State machine + aggregator
+
+- [ ] **A** **Idle** via `GetLastInputInfo`: enter `idle` after **300 s continuous
+      no-input** (any input resets the timer); **leave on any input**.
+- [ ] **A** **Media** via **GSMTC** (Playing?) → `passive_media`; **gated WASAPI
+      fallback** (recent ≤60 s non-comms GSMTC source); **an active comms call always
+      overrides** (calls are never `passive_media`); media transitions bypass hysteresis.
 - [ ] **A** **Three-state machine** (`active` / `passive_media` / `idle`).
 - [ ] **A** **Interval aggregator** (Model B): flush on **HWND**/app/domain/state
-      change; idle **splits** the interval; **durations from a monotonic clock**;
-      **close the open interval on sleep/suspend** (`PowerModeChanged`), reopen idle
-      on resume. *(sleep/clock were Ph7)*
-- [ ] **A** **Graceful shutdown**: on `ApplicationStopping`, flush the open interval
-      to the buffer (and stop the helper) so restarts don't lose activity.
-- [ ] **A** Helper → service transport: **length-prefixed JSON named pipe** with a
-      LocalSystem+user security descriptor (no other process can inject samples).
-- [ ] **A** Heartbeat carries **capture health** (`helperRunning`, `lastSampleUtc`,
-      `helperRestartCount`). *(so "online" ≠ "service alive but helper dead")*
-- [ ] **A** **Unit tests** for the state machine + aggregator (pure logic), incl.
-      the **oscillating-input** (hysteresis) and **sleep-resume** scenarios.
+      change; idle **splits**; **durations from a monotonic clock** (`durationSec`
+      canonical); **close on sleep via `SERVICE_CONTROL_POWEREVENT`** (sub-30 s blip
+      debounce; monotonic sanity force-close for missed/Modern-Standby events);
+      **re-derive state from the first post-resume sample** (not hardcoded `idle`).
+- [ ] **A** **Graceful shutdown**: on `ApplicationStopping`, flush the open interval.
+- [ ] **A** **Unit tests** (pure logic): the **call-vs-media gating**, **idle
+      reset-on-input** (no oscillation), **bursty-input call stays active not idle**,
+      **sleep-resume with media auto-resume**, eTLD+1 normalization stub.
 - [ ] **M** README: what's captured and how to watch it live in dev.
 
-**Exit gate:** running in dev and switching apps / playing a video / **being on a
-Teams call** / going idle / sleeping+resuming produces correct intervals with
-correct states (the call is `active`/`idle`, **not** `passive_media`); the helper
-relaunches correctly on a fast user switch; verified live in the logs.
+**1b exit gate:** switching apps / playing a video / **being on a Teams call (with
+Spotify also playing)** / going idle / sleeping+resuming produces correct intervals
+and states (the call is `active`/`idle`, **never** `passive_media`); verified live.
 
 ---
 
@@ -103,32 +123,40 @@ relaunches correctly on a fast user switch; verified live in the logs.
 
 - [ ] **A** **SQLite** buffer with **app-layer AES-GCM** encryption (key via **DPAPI
       machine scope**; no native dep), ACL-locked under `C:\ProgramData\...`.
-- [ ] **A** Append closed intervals; `synced` flag; buffer cap. When the cap forces a
-      drop, **never silently**: log it and report `dropped {count,oldest,newest}` on
-      the next heartbeat (prefer dropping `idle` over active/passive). *(was Ph7)*
+- [ ] **A** Append closed intervals; `synced` flag; buffer cap. A cap drop is **never
+      silent**: log it + report `dropped {count, oldest, newest, byState}` (prefer
+      dropping `idle`); the server persists it as a `dataGap`. *(was Ph7)*
 - [ ] **A** **Sync loop** (5 min **±30 s jitter**): gzip batch with a **UUID
-      `batchId`** → `/ingest`; **ACK before purge** (verify response `batchId`).
-- [ ] **A** Exponential backoff **+ jitter**; offline accumulation; honor
-      `Retry-After`; **persist nothing about `batchId` across restarts is needed**
-      (UUID removes reuse risk).
+      `batchId`** → `/ingest`; **ACK before purge** (verify response `batchId`). The
+      agent **self-splits before send** when over the size cap (fresh UUID per
+      sub-batch, recursive halving), spacing sub-batches per the rate limit.
+- [ ] **A** Exponential backoff **+ jitter**; offline accumulation; honor `Retry-After`.
 - [ ] **A** **Config validation**: clamp/ignore out-of-range server config values.
+- [ ] **A** **Token-loss recovery**: lost DPAPI token → re-enroll **rotates** (new
+      token); buffered rows then sync under it.
 - [ ] **C** `/api/v1/ingest` per contract: validate token **(bound to deviceId)**,
-      **atomic per batch in one transaction**, write the **`batches` receipt**,
-      dedupe on `{deviceId,batchId}`, resolve **category + employeeId** at ingest.
-- [ ] **C** `intervals` + `batches` collections + indexes (`{deviceId,batchId}`
-      unique, `{employeeId,startUtc}`); `deviceTokens.tokenHash` unique index.
-- [ ] **C** **Device `status` state machine** (server side: pending/online/offline/
-      outdated/revoked) driven by heartbeat + admin actions.
-- [ ] **C** **Rate limiting** on `/ingest`,`/heartbeat`,`/enroll` (per device/IP).
+      **atomic per batch** (one txn, ≤1000 intervals, `maxCommitTimeMS`, retry on
+      `TransientTransactionError`), write the **`batches` receipt**, resolve
+      **category + employeeId** at ingest.
+- [ ] **C** Collections + indexes: `intervals` `{deviceId,batchId}` **NON-unique**,
+      `{employeeId,startUtc}`; **`batches` unique `{deviceId,batchId}` + TTL on
+      `receivedAt`**; `deviceTokens.tokenHash` unique. *(unique-index bug fixed — r2)*
+- [ ] **C** **Device state = liveness + flags** (server side), driven by heartbeat +
+      admin actions; `/heartbeat` **accepts a revoked token** (→ `flags:[revoked]`).
+- [ ] **C** **Rate limiting** per device/IP; `/enroll` = 10/min/IP with a
+      **corp-CIDR allowlist** so the rollout isn't throttled.
 - [ ] **C** **Org-key array + rotation** in `settings`; **blocked device → `403`** at
-      `/enroll`; re-enroll returns the existing token (no rotation). *(was Ph7)*
+      `/enroll` (org-key checked first); **"forget device"** action deletes intervals
+      **and** receipts. *(was Ph7)*
 - [ ] **A** Unit tests for batching / retry / purge-after-ack.
-- [ ] **C** Integration tests: batch in → stored once; **partial-insert-then-retry**
-      never loses or duplicates; stale replay of an admin-deleted batch is rejected.
+- [ ] **C** Integration tests: batch of N stored once; **partial-insert-then-retry**
+      never loses/duplicates; stale replay of an admin-deleted batch is rejected;
+      **end-to-end revocation** (revoke → `/ingest` 401, `/enroll` 403, `/heartbeat`
+      200 `revoked`, dashboard shows revoked). *(revocation E2E moved here from Ph7)*
 
 **Exit gate:** intervals captured offline flush to MongoDB when connectivity
 returns; retried/partial/stale batches never double-store or resurrect data; a
-buffer-cap drop is visible on the heartbeat panel.
+buffer-cap drop is visible on the heartbeat panel; revocation works end-to-end.
 
 ---
 
@@ -172,14 +200,19 @@ supported browsers all yield correct normalized `domain` + `pageTitle` intervals
 - [ ] **C** **Device → employee** management UI.
 - [ ] **C** **Category rules** UI (`exact/domain/process → category` with
       precedence + priority), unknown = neutral; bulk re-resolve when rules change.
-- [ ] **C** **Day/week bucketing uses the org timezone** (`Asia/Dhaka`); timeline
-      **rendering** in the **viewer's** local zone, converted client-side (no
-      SSR/CSR flicker).
-- [ ] **C** **Audit log** of destructive/rules-changing admin actions; **device→
-      employee remap** writes an `auditLog` entry and re-resolves affected intervals.
+- [ ] **C** **Day/week bucketing** uses `orgTimeZone` (or `employees.tzOverride`),
+      clock-skew offset applied **before** the boundary; summary returns org-tz
+      `bucketDate`+`bucketTimeZone` (not client-converted); timeline **rendering** in
+      the **viewer's** local zone (no SSR/CSR flicker).
+- [ ] **C** **Audit-log viewer** (infra shipped in Phase 0). A **device→employee
+      remap** updates **future** intervals; a **separate bulk-reassign** action
+      re-resolves a historical range (audit-logged). `osUsername` is never back-filled.
+- [ ] **C** Dashboard reads device **liveness + flags** (not derived fields); flags a
+      device showing **≥2 distinct `osUsername`s** in 24 h (possible mis-map).
 - [ ] **C** Upgrade admin auth to **NextAuth** (per-admin accounts/roles) on top of
-      Cloudflare Access; dashboard reads device **`status`** (not derived fields).
-- [ ] **C** Component/integration tests for aggregation queries.
+      Cloudflare Access.
+- [ ] **C** Component/integration tests, incl. a **clock-skewed device buckets into
+      the correct local day** and a **workday crossing Dhaka midnight** test.
 
 **Exit gate:** a real day of captured data renders correctly across all views;
 day-buckets honor the org timezone, timeline times show in the viewer's zone; admin
@@ -203,8 +236,11 @@ actions are audit-logged.
 - [ ] **A** Verify on an **AppLocker/WDAC-hardened** reference machine: binary
       allow-listed, helper launches, ProgramData R/W + DPAPI work under the
       restricted token; document the GPO allow-list snippet.
-- [ ] **M** README/runbook: **GPO cert pre-trust** to `LocalMachine\Root`, install +
-      uninstall + PC-name steps for IT.
+- [ ] **A** **MSI upgrade/repair preserves** `C:\ProgramData\AtlasGreen` (DeviceId +
+      DPAPI blobs + buffer) — only full uninstall removes it.
+- [ ] **M** README/runbook: cert pre-trust to `LocalMachine\Root` — **GPO** on AD
+      machines **and** the **PowerShell `Import-Certificate` / MSI custom-action**
+      path for **workgroup** PCs; install + uninstall + PC-name steps for IT.
 
 **Exit gate:** clean install on a test machine (incl. one hardened machine) runs
 invisibly, captures + syncs, survives reboot/logout, and a standard user cannot
@@ -216,20 +252,24 @@ stop it; no SmartScreen/AV prompt with the cert pre-trusted.
 
 **Goal:** push code once → fleet updates itself.
 
-- [ ] **A** Self-signed code-signing cert + **GPO trust** process documented.
+- [ ] **A** Self-signed code-signing cert + cert-trust process documented (GPO + the
+      workgroup PowerShell/MSI path).
 - [ ] **A** Update client: heartbeat says "newer exists" → **verify manifest
       signature** → download from **R2 with HTTP Range/resume** → verify package
       **signature + SHA-256** → **swap (staging dir + rename on OnStop, no reboot)** →
-      restart; abort safely on failure (report `updateStatus: failed`).
-- [ ] **A** Honor **`configSchemaVersion`** (ignore-unknown) so a new agent against an
-      old config doesn't break; support **downgrade** (`latestVersion < current`).
-- [ ] **C/M** Publish a **signed `manifest.json`** + package to R2 (release pipeline).
+      restart; **on startup, finish a stranded swap** (`pending-update` marker) before
+      the main loop; abort safely on failure (report `updateStatus: failed`).
+- [ ] **A** Honor **`configSchemaVersion`** (ignore-unknown); support **downgrade**
+      (`latestVersion < current`); `mandatory:true` updates ASAP but never shuts off
+      ingest.
+- [ ] **C/M** Publish a **signed `manifest.json`** + package to R2 (release pipeline);
+      **R2 keeps the last 5 versions** for downgrade.
 - [ ] **A** GitHub Actions (Windows): test → publish → MSI → **sign package +
       manifest** → upload R2 → update manifest.
 - [ ] **C** Console deploy pipeline (VPS/dokploy) confirmed; **daily mongodump → R2**
-      backup with a restore test.
+      with a **rehearsed restore** (restore data → `rs.initiate()` → transactions resume).
 - [ ] **A** End-to-end update test: vX → vY on a running agent (and a forced
-      downgrade vY → vX).
+      downgrade vY → vX), incl. a **crash-mid-swap** recovery.
 
 **Exit gate:** a running agent auto-updates to a newly released version without
 manual touch; **a tampered manifest or bad signature is rejected**; a resumed
@@ -244,16 +284,15 @@ phases. (Most former Phase-7 items were redistributed to the phase that owns the
 helper/session/sleep/clock → Ph1, buffer-cap/revocation/org-key → Ph2, browser
 variants/DPI → Ph3, AV/AppLocker → Ph5 — to avoid a tar-pit final phase.)
 
-- [ ] Multi-monitor; PWAs / Electron apps (appName edge cases).
-- [ ] **100-device soak test**: simulate 100 agents for 24 h with realistic
-      intervals — zero dropped batches, dashboard queries < 2 s, stable VPS
-      CPU/memory.
-- [ ] End-to-end **token revocation → re-enroll-blocked (`403`) → revoked state** on a
-      real agent.
-- [ ] Sweep any edge cases found during earlier phases (expand as discovered).
+- [ ] Multi-monitor (incl. the `passive_media`-on-non-foreground-monitor attribution
+      limit); PWAs / Electron apps (appName edge cases).
+- [ ] **100-device soak + chaos test**: 24 h of realistic intervals → zero dropped
+      batches, queries < 2 s, stable VPS; **plus chaos** — kill helper on 5%, partition
+      the network 10 min (backlog flushes, no dupes), re-enroll 1% mid-stream, inject a
+      bogus `batchId` (rejected without affecting others).
+- [ ] Resolve any `phase-7`-labelled edge cases triaged during earlier phases.
 
-**Exit gate:** soak test passes at 100 devices; revocation flow verified end-to-end;
-no data loss or noticeable footprint.
+**Exit gate:** soak + chaos pass at 100 devices; no data loss or noticeable footprint.
 
 ---
 
