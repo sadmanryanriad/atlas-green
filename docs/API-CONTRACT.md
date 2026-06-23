@@ -1,9 +1,10 @@
-# Atlas Green — API Contract (v1.2)
+# Atlas Green — API Contract (v1.3)
 
 > **This document is authoritative.** `atlas-agent` and `atlas-console` must both
 > implement it exactly. To change the contract: edit this file first, bump the
 > version, then update both sides. Never let the two implementations drift.
-> **When this file is bumped, verify both child `AGENTS.md` files still match.**
+> **When this file is bumped, verify both child `AGENTS.md` files still match, and
+> search the file for the old `X-Atlas-Contract` value and update every occurrence.**
 >
 > **v1.1 (2026-06)** folded in the first multi-model review: UUID `batchId` +
 > `batches` receipt + atomic ingest; capture-health, `sessionId`, `urlCaptureMethod`,
@@ -15,6 +16,17 @@
 > device `status` becomes **liveness + flags**; `/enroll` rate limit relaxed for the
 > office NAT; `durationSec` is canonical; device timezone + `configSchemaVersion`
 > added to heartbeat; `dropped.byState`. The URL path stays `/api/v1`.
+>
+> **v1.3 (2026-06, iteration-3 review)** — precision pass (no architectural change):
+> wire header bumped to **`1.3`** (`426`/deprecation compares the **major** only);
+> `/enroll` gains an optional `Authorization` so no-op and rotation are decidable;
+> `archive` defined as a reversible ingest-blocking "retire" (distinct from revoke
+> and block-&-wipe); revoked-token heartbeat **freezes capture-health** and the
+> dashboard shows `revoked` as the primary badge; `reauthorized` is **sticky until
+> the agent acts** and resumes `/ingest` before re-enrolling; `401` recovery is
+> **scoped by endpoint**; `batches` TTL is **tied to `bufferCapDays`**; new `capture.
+> enabled`, and `tamper`/`config_mismatch` flags; `contractDeprecated` trigger,
+> `health_warning` thresholds, and the block-&-wipe admin endpoint are specified.
 
 - **Base URL**: `https://<console-host>/api/v1`
 - **Transport**: HTTPS only.
@@ -28,9 +40,12 @@
   - The server **binds each token to its `deviceId`** at enrollment and **rejects**
     any `/ingest` or `/heartbeat` whose body `deviceId` ≠ the token's bound
     `deviceId` (`401`). A token can only ever submit its own device's data.
-- **Contract version** is echoed by the server in every response (header
-  `X-Atlas-Contract: 1.1`) and sent by the agent as `X-Atlas-Contract: 1.1`. On a
-  major mismatch the server returns `426 Upgrade Required`.
+- **Contract version** is the **wire** version `major.minor` (currently **`1.3`**),
+  independent of any doc revision number. It is echoed by the server in every response
+  (header `X-Atlas-Contract: 1.3`) and sent by the agent as `X-Atlas-Contract: 1.3`.
+  The mismatch check compares the **major component only** — a minor bump
+  (1.1→1.2→1.3) is additive and never triggers it. On a **major** mismatch the server
+  returns `426 Upgrade Required` (for `/enroll` and `/ingest` only — see §5).
 
 ---
 
@@ -41,6 +56,7 @@ Called **once** on first run (and again only if the device token is lost/revoked
 **Request headers**
 ```
 X-Atlas-Org-Key: <shared org key>
+Authorization: Bearer <existing device token>   // OPTIONAL — sent only if the agent still has one
 Content-Type: application/json
 ```
 
@@ -79,24 +95,32 @@ Content-Type: application/json
 
 **Behavior**
 - Enrollment is **idempotent on `deviceId`**, with **token-loss recovery by
-  rotation** (v1.2): a re-enroll that **presents a valid existing token** is a no-op
-  (returns the device record, same token still valid). A re-enroll **without** a
-  valid token — the normal case after a lost/corrupted DPAPI blob — **rotates**: the
-  server marks the prior `deviceTokens` row `supersededAt` and issues a **new**
-  token. (Tokens are stored hashed, so the server cannot "return the existing" one;
-  rotation is safe because batches are keyed by `deviceId`+`batchId`, not token era,
-  so buffered rows still sync under the new token.)
+  rotation** (v1.2/1.3). The agent **sends `Authorization: Bearer <token>` iff it
+  still has a stored token**, which makes no-op and rotation decidable:
+  - **`Authorization` present and the token hash matches a valid, non-revoked row
+    bound to this `deviceId`** → **no-op**: return the device record, same token
+    stays valid (an agent that re-enrolled defensively keeps its token).
+  - **`Authorization` absent or invalid/unknown** — the normal case after a
+    lost/corrupted DPAPI blob — → **rotate**: mark the prior `deviceTokens` row
+    `supersededAt` and issue a **new** token. (Tokens are stored hashed, so the
+    server cannot "return the existing" one; rotation is safe because batches are
+    keyed by `deviceId`+`batchId`, not token era, so buffered rows still sync.)
+  - Re-enroll attempts are **strictly sequential** (never two `/enroll` in flight).
+    A no-`Authorization` enroll arriving within a short window of a *still-unused*
+    freshly-minted token returns **that same token** rather than rotating again, so a
+    network-blip retry can't burn two rotation cycles (the double-rotation race).
 - **Auth-check order**: validate the **org key first** (`401` if invalid), **then**
-  the device block (`403` if blocked/revoked) — so a caller without a valid org key
-  can't probe block status. `/enroll` must not silently un-revoke a blocked device.
+  the device block (`403` if blocked/revoked/archived), **then** the optional
+  `Authorization` — so a caller without a valid org key can't probe block status.
+  `/enroll` must not silently un-revoke a blocked or archived device.
 - The server may hold **multiple active org keys** (rotation with a transition
   window); any currently-valid key is accepted.
 - **Config validation**: the agent **clamps/ignores** out-of-range config values
   (keeps the previous value, logs a warning). The ranges above are authoritative.
 
-**Errors**: `401` (bad org key / token-device mismatch), `403` (blocked device),
-`400` (malformed), `426` (contract mismatch on enroll/ingest only), `429` (rate
-limit), `5xx`.
+**Errors**: `401` (bad org key / token-device mismatch), `403` (blocked, revoked, or
+archived device), `400` (malformed), `426` (major contract mismatch on enroll/ingest
+only), `429` (rate limit), `5xx`.
 
 ---
 
@@ -152,13 +176,21 @@ Content-Encoding: gzip
 - **Atomic per batch.** The server writes the `batchId` receipt into the **`batches`
   collection** and inserts all intervals in **one MongoDB transaction** (≤ 1000
   intervals/txn) — all or nothing. There is no partial accept.
-- **Idempotency uniqueness lives on `batches` only** (`{deviceId, batchId}` unique).
-  On `intervals` it is a **non-unique** index — every interval in a batch shares the
-  same `batchId`, so a unique index there would reject all but the first. A retry of
-  an already-received batch returns the original `accepted` with `duplicate: true`,
-  re-inserting nothing. The `batches` collection is **retained independently** of
-  `intervals` (with a TTL ~180 d), so a stale replay of a batch whose intervals an
-  admin already deleted is **rejected as a duplicate**, not resurrected.
+- **Idempotency uniqueness lives on `batches` only** — `_id = batchId` (a UUIDv4 is
+  already globally unique, so no compound unique index is needed; `deviceId` is stored
+  for scoping with a non-unique `{deviceId, receivedAt}` index for purge queries). On
+  `intervals` the `{deviceId, batchId}` index is **non-unique** — every interval in a
+  batch shares the same `batchId`, so a unique index there would reject all but the
+  first. A retry of an already-received batch returns the original `accepted` with
+  `duplicate: true`, re-inserting nothing. The `batches` collection is **retained
+  independently** of `intervals`, so a stale replay of a batch whose intervals an
+  admin already deleted is **rejected as a duplicate**, not resurrected — *within the
+  receipt TTL*. The TTL must **exceed the fleet's max `bufferCapDays`**:
+  `batchReceiptDays = max(180, maxBufferCapDays + 45)`, stored as a per-receipt
+  `expireAt` (TTL on `expireAt`) so raising `bufferCapDays` at runtime extends it. The
+  agent correspondingly **drops unsynced rows older than `min(bufferCapDays,
+  serverBatchesTtl)`** (with a `dropped` report) so a long-offline or crash-corrupted
+  buffer can't replay a batch past its evicted receipt and duplicate data.
 - `durationSec` (from the agent's monotonic clock) is the **canonical** duration;
   consumers must **not** derive duration from `endUtc − startUtc` (they can differ
   after a clock correction). Server logs a warning if they diverge by > 5 s.
@@ -172,10 +204,11 @@ Content-Encoding: gzip
   again (recursive halving). Sub-batches obey the same rate limit (don't fire them
   all at once).
 
-**Errors**: `401` (bad/revoked token, or token↔deviceId mismatch), `400`
-(malformed/bad gzip / `durationSec` out of bounds), `413` (batch too large —
-split), `426` (contract mismatch), `429` (rate-limited — honor `Retry-After`),
-`5xx` (agent keeps rows, backs off with jitter).
+**Errors**: `401` (bad/revoked/**archived** token, or token↔deviceId mismatch — a
+revoked *or* archived device is ingest-blocked), `400` (malformed/bad gzip /
+`durationSec` out of bounds), `413` (batch too large — split), `426` (major contract
+mismatch), `429` (rate-limited — honor `Retry-After`), `5xx` (agent keeps rows, backs
+off with jitter), `404` (device doc deleted — re-enroll once).
 
 ---
 
@@ -199,11 +232,13 @@ Authorization: Bearer <device token>
   "lastSyncUtc": "2026-06-22T09:10:06.000Z",
   "health": { "cpuPct": 0.4, "memMb": 38 },
   "capture": {                      // proves the HELPER (not just the service) is alive
+    "enabled": true,                // false when capture is paused (revoked/archived) — dashboard mutes the panel
     "helperRunning": true,          // service's view: pipe connected + recent sample
     "lastSampleUtc": "2026-06-22T09:14:58.000Z",
     "helperStartedAtUtc": "2026-06-22T09:00:11.000Z",
     "helperRestartCount": 0
   },
+  "tamperHints": ["powertoys_awake"],  // known keep-awake/jiggler processes seen (→ server tamper flag); omit/[] if none
   "dropped": {                      // present only when the buffer cap forced a drop
     "count": 0, "oldestUtc": null, "newestUtc": null,
     "byState": { "active": 0, "passive_media": 0, "idle": 0 }
@@ -223,10 +258,10 @@ Authorization: Bearer <device token>
 ```jsonc
 {
   "serverTimeUtc": "2026-06-22T09:15:00.000Z",
-  "liveness": "online",             // device liveness (server-owned)
-  "flags": [],                      // e.g. ["outdated","clock_skewed","revoked"]
-  "reauthorized": false,            // true once after an admin un-revoke → agent resumes capture
-  "contractDeprecated": false,      // true if the agent's contract major is being phased out
+  "liveness": "online",             // "pending" (enrolled, not yet seen) | "online" | "offline"; informational for the agent
+  "flags": [],                      // ALWAYS an array; e.g. ["outdated","clock_skewed","revoked","archived","health_warning","possible_clone","tamper","config_mismatch"]
+  "reauthorized": false,            // sticky true after admin un-revoke/un-archive, until the agent acts (a successful /ingest)
+  "contractDeprecated": false,      // server-set when settings.contractDeprecation marks the agent's MAJOR "warn"/"reject"; never true for the current major
   "config": {                       // same shape as /enroll (all remotely-tunable fields)
     "configSchemaVersion": 1,
     "sampleIntervalSec": 4, "idleThresholdSec": 300, "syncIntervalSec": 300,
@@ -242,31 +277,47 @@ Authorization: Bearer <device token>
 
 **Behavior**
 - `/heartbeat` **always returns `200`** (it is the recovery lifeline) — including for
-  a **revoked** token (response carries `flags:["revoked"]`; the agent stops
-  capturing, keeps its buffer) and including across a major contract bump (`426` is
-  for `/enroll` and `/ingest` only; here set `contractDeprecated:true`). A token↔
-  deviceId mismatch is still `401`; a valid token whose **device doc was deleted** →
-  `404`, and the agent re-enrolls.
-- Server sets `liveness` (`online`; `offline` after `heartbeatIntervalSec × 3`,
-  default 15 min) and `flags` (`outdated`/`clock_skewed`/`revoked`/`archived`/
-  `health_warning`) — see `ARCHITECTURE.md` §7. The helper is "down"
-  (`helperRunning:false`) when no sample has arrived for ~60 s; `helperRestartCount`
-  spikes raise a tamper indicator.
+  a **revoked or archived** token (response carries `flags:["revoked"]` / `["archived"]`;
+  the agent pauses capture, keeps its buffer) and including across a major contract
+  bump (`426` is for `/enroll` and `/ingest` only; here set `contractDeprecated:true`).
+  A token↔deviceId mismatch is still `401`; a valid token whose **device doc was
+  deleted** → `404`.
+- **Revoked/archived heartbeat is restricted**: it updates `lastSeenAt` (so the device
+  shows online, not falsely "offline") **but must not refresh capture-health**
+  (`capture.*`, `helperRunning`, `lastSampleUtc`) or clear `health_warning`/
+  `possible_clone` — those **freeze at the revoke/archive instant**, so a leaked
+  revoked token can't spoof a healthy/online device (the silent-agent backstop, #17,
+  stays intact). The **dashboard renders `revoked` (then `archived`) as the primary
+  badge, overriding `liveness`** — "online + revoked" displays as "revoked".
+- Server sets `liveness` (`pending` until first interval/seen, then `online`;
+  `offline` after `heartbeatIntervalSec × 3`, default 15 min) and `flags`
+  (`outdated`/`clock_skewed`/`revoked`/`archived`/`health_warning`/`possible_clone`/
+  `tamper`/`config_mismatch`) — triggers + clear conditions in `ARCHITECTURE.md` §7.
+  `health_warning` = `cpuPct > 5` for **3 consecutive heartbeats** OR `memMb > 200` on
+  any one (cleared after 2 normal); `config_mismatch` = the agent's
+  `configSchemaVersion` is **below** the server's; `tamper` = the heartbeat reported
+  `tamperHints`. The helper is "down" (`helperRunning:false`) when no sample has
+  arrived for ~60 s.
 - The server **persists** a non-zero `dropped` as a `dataGap` record (so the gap
   stays visible historically) and surfaces `helperRunning:false`/stale
   `lastSampleUtc` and `updateStatus:"failed"` in the heartbeat panel.
-- Server applies mutable `attributes` to the device doc (identity unchanged);
-  `pcName` is **admin-owned** (the agent's reported `pcName` is logged, not stored —
-  admins rename from the dashboard), while `hostname`/`osUsername`/`timezone`/
-  `machineGuid` are agent-owned. Multiple distinct `machineGuid`s on one `deviceId`
-  → a `possible_clone` flag.
-- On `reauthorized:true` the agent exits its revoked state and resumes (re-enrolls
-  for a fresh token/config). The agent applies returned `config`; **out-of-range
-  values are ignored** (see §1); a `configSchemaVersion` newer than it supports →
-  ignore-unknown + log. It computes `clockOffset = serverTimeUtc − localUtc` and
-  flags a skew (see §5). On a heartbeat failure it **retries once after ~30 s**, else
-  waits
-  for the next cycle.
+- Server applies mutable `attributes` to the device doc (identity unchanged). The
+  agent's reported **`pcName` is informational — logged, not stored** (admins rename
+  from the dashboard); `hostname`/`osUsername`/`timezone`/`machineGuid` are
+  **agent-owned** and written to the doc. **Two or more distinct non-`null`**
+  `machineGuid`s on one `deviceId` → `possible_clone` (a `null` from an intermittent
+  read is ignored).
+- On `reauthorized:true` the agent exits its paused state and **resumes `/ingest`
+  with its existing (now-valid) token first** — it re-enrolls **only** if that still
+  returns `401`. Because `reauthorized` is sticky until a successful `/ingest`, a
+  missed heartbeat can't strand recovery. **`401` recovery is scoped by endpoint**: a
+  `401` from **`/ingest`** → a single re-enroll with the org key (the same-identity
+  recovery); a `401` from **`/heartbeat`** (token↔deviceId mismatch / superseded) or a
+  `404` (deleted doc) → **re-enroll as a new device**. The agent applies returned
+  `config`; **out-of-range values are ignored** (see §1); a `configSchemaVersion`
+  newer than it supports → ignore-unknown + log. It computes `clockOffset =
+  serverTimeUtc − localUtc` and flags a skew (see §5). On a heartbeat failure it
+  **retries once after ~30 s**, else waits for the next cycle.
 
 ---
 
@@ -319,10 +370,13 @@ removed in v1.1 to avoid two sources of truth.)
 
 ## 5. Conventions
 
-- **Versioning**: the path carries the major version (`/api/v1`). Breaking changes
-  → `/api/v2`; the agent sends `X-Atlas-Contract` and the server returns `426` on a
-  major mismatch **for `/enroll` and `/ingest` only** — **`/heartbeat` always 200**
+- **Versioning**: the path carries the major version (`/api/v1`); `X-Atlas-Contract`
+  carries the wire `major.minor` (`1.3`). Breaking changes → `/api/v2`; the server
+  returns `426` only on a **major** mismatch and **only for `/enroll` and `/ingest`**
+  — minor bumps (1.x) are additive and never 426 — while **`/heartbeat` always 200**
   (with `contractDeprecated:true` + the `update` block) so any agent can self-update.
+  `contractDeprecated` is driven by `settings.contractDeprecation: { [major]: "warn" |
+  "reject" }` and is never set for the current major.
 - **Clock skew**: the agent stamps timestamps from its own UTC clock and **never
   rewrites already-buffered timestamps**, but `durationSec` comes from a **monotonic
   clock** and is **canonical** (don't derive duration from `endUtc − startUtc`). It
@@ -339,9 +393,36 @@ removed in v1.1 to avoid two sources of truth.)
 - **Backoff & jitter**: failed sync retries use exponential backoff **with ±jitter**
   (so 100 agents recovering after an outage don't thunder-herd in lockstep); the
   5-min sync timer also carries ±30 s jitter.
-- **Auth failures** (`401`): on a revoked/invalid device token the agent attempts a
-  single re-`/enroll` with the org key. If `/enroll` returns `403` (blocked device)
-  or re-enroll fails repeatedly, the agent stops generating new intervals, keeps its
-  buffer, and only heartbeats (`status` reflects `revoked`).
+- **Auth failures**, scoped by endpoint: a **`401` from `/ingest`** (revoked/invalid
+  token) → the agent attempts a **single re-`/enroll`** with the org key (sending its
+  current token as `Authorization` if it still has one). If `/enroll` returns `403`
+  (blocked/revoked/archived) the agent **pauses capture, keeps its buffer, and only
+  heartbeats** (`flags` reflect `revoked`/`archived`) until a `reauthorized:true`. If
+  `/enroll` returns **`401` (bad org key — the MSI's key may have been rotated, *not*
+  a block)**, the agent logs a critical warning and **keeps heartbeating with its
+  existing token** (which is valid again after an un-revoke) rather than entering the
+  paused state. A **`401` from `/heartbeat`** (token↔deviceId mismatch / superseded)
+  or a **`404`** (deleted doc) → the agent **re-enrolls as a new device**. Re-enrolls
+  are sequential and capped (~5 / hour) to avoid a loop draining the org-key budget.
 - **Secrets**: the org key lives only in the MSI/agent and is used only at enroll;
   device tokens are stored hashed server-side and DPAPI-encrypted client-side.
+
+---
+
+## 6. Admin actions (dashboard → server)
+
+These are **admin** endpoints (behind Cloudflare Access + `middleware.ts`, not agent
+Bearer auth); shapes are owned by the console but the security-relevant semantics are
+fixed here. Every action writes an `auditLog` entry **before** any destructive step.
+
+- **Revoke / un-revoke** a device — sets/clears `deviceTokens.revokedAt` + the
+  `revoked` flag (token dies / self-heals via `reauthorized`).
+- **Archive / un-archive** a device — sets/clears `archived` + the `archived` flag
+  (ingest-blocked but token stays valid; reversible — Decision #49).
+- **`POST /api/v1/admin/devices/:deviceId/wipe`** (block & wipe, Decision #48) —
+  atomically: revoke the token, set `blocked` **permanently**, and delete the device's
+  `intervals`, `batches` receipts, and `dataGaps`. The minimal device doc is
+  **retained** (so the `deviceId` can't re-enroll) as a tombstone; response
+  `{ deviceId, deletedIntervals, deletedBatches, revokedAt }`. Irreversible.
+- All four go through the single `updateDeviceState` path so `liveness`/`flags` stay
+  consistent with the source booleans (Decision #39).

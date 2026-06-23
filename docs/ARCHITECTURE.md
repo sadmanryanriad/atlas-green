@@ -99,7 +99,10 @@ has a security descriptor restricting it to **LocalSystem + the interactive user
 Because the user is an allowed pipe client, the service **verifies the peer** on
 connect — `GetNamedPipeClientProcessId` → `QueryFullProcessImageName` → confirm it's
 the installed helper exe and **code-signed by the agent cert** — and rejects anything
-else (a standard user can otherwise connect and inject fake samples). On connect the
+else (a standard user can otherwise connect and inject fake samples). **In dev** (the
+agent running as a console, helper unsigned — the signing cert isn't created until
+Phase 5/6) the signature check is **skipped behind a dev flag**; only the image-path
+check runs. In prod (Windows Service) the **full signature check is mandatory**. On connect the
 helper sends a **per-instance UUID** handshake; the service dedupes samples by
 `(instanceId, seq)`, so a seq reset after a helper restart can't falsely drop the
 first post-restart samples. The helper auto-reconnects with ~1 s backoff.
@@ -123,7 +126,10 @@ first post-restart samples. The helper auto-reconnects with ~1 s backoff.
    time; on **resume the new interval's state is re-derived from the next sample**
    (it may be `passive_media` if media auto-resumed — not presumed `idle`). A
    monotonic sanity check force-closes any open interval whose elapsed time exceeds
-   the idle threshold ×3, in case a power event is missed (VM / Modern Standby).
+   the idle threshold ×3, in case a power event is missed (VM / Modern Standby). A
+   force-close **splits**: the span up to the last real sample keeps its sampled
+   state, the gap after it is recorded **`idle`** (+ a `missed_power_event` log), so a
+   silent multi-hour hang never becomes a phantom `active` block.
 4. Every **5 min** (±30 s jitter), the sync loop gathers unsynced rows, gzips them
    as one JSON batch with a **UUID `batchId`**, and `POST`s to `/api/v1/ingest`.
 5. On HTTP 200 + ACK (with a matching `batchId`), the service marks those rows
@@ -155,13 +161,18 @@ overrides** — even if Spotify is also playing, a user on a Teams call is never
 call is `idle` until they provide input. Misclassifying a 3-hour client call as
 "passive media" would be both wrong and damaging.
 
-**Hysteresis** (Decision #34): the machine enters `idle` only after **300 s of
-continuous no-input** — any input **resets** the 300 s timer, which is what stops the
-boundary oscillation — and **leaves `idle` on any input** (→ `active`). Hysteresis
-governs only the input-driven `idle ↔ active` boundary; **media transitions are
-immediate** (`idle → passive_media` the moment media is detected, no wait). Sub-~5 s
-intervals are merged, resolving a "presumed-then-sampled" conflict in favor of the
-sampled state.
+**Hysteresis** (Decision #34): the machine enters `idle` after **300 s with no
+meaningful input** — and only a **meaningful input quantum** (≥~2 s of sustained input
+**or** ≥3 input events within a 10 s window; a mouse-move < 4 px is ignored) **resets**
+the timer / **leaves `idle`** (→ `active`). A *single isolated event* — one mouse-poll,
+one jiggle — does not. This sits between v1.1's "30 s sustained" rule (which buried a
+bursty-typing call as `idle`) and v1.2's "any input" rule (which let a $2 mouse-jiggler
+or a wireless-mouse keepalive keep an empty desk perpetually `active`); a deliberate
+keep-awake tool is additionally surfaced as a **`tamper` flag** (Decision #51), since
+the quantum can't always tell patterned fakery from real bursts. Hysteresis governs
+only the input-driven `idle ↔ active` boundary; **media transitions are immediate**
+(`idle → passive_media` the moment media is detected, no wait). Sub-~5 s intervals are
+merged, resolving a "presumed-then-sampled" conflict in favor of the sampled state.
 
 Idle **splits** an interval: if the user is active on an app and then goes idle on
 the same app, that produces an `active` interval followed by an `idle` interval, so
@@ -212,8 +223,19 @@ with the game's process name. AFK-in-game (no input, no media) → `idle`. Hones
   (`/enroll` exempts a corp-CIDR allowlist so the manual rollout isn't blocked).
 - **Revoked devices stay visible, not dark**: a revoked token is rejected on
   `/ingest`/`/enroll` but **accepted on `/heartbeat`** (→ `flags:[revoked]`), so the
-  machine shows as `revoked` rather than silently "offline"; an admin un-revoke sets
-  `reauthorized` on the next heartbeat and the agent self-heals.
+  machine shows as `revoked` rather than silently "offline"; an admin un-revoke sets a
+  **sticky** `reauthorized` (until the agent acts) and the agent self-heals by
+  resuming `/ingest` on its existing token. A revoked heartbeat updates `lastSeenAt`
+  only — **capture-health fields freeze** at the revoke instant and the dashboard shows
+  `revoked` as the primary badge — so a leaked revoked token can't fake a healthy,
+  online device (keeping the silent-agent backstop honest).
+- **Three distinct admin actions** (Decisions #45/#49/#48): **revoke** = security kill
+  (token dies; `/ingest`+`/enroll` `401`/`403`); **archive** = retire (token stays
+  valid but ingest-blocked, agent pauses capture, reversible — for a decommissioned PC
+  or departed employee whose history is kept); **block & wipe** = irreversible erase
+  (delete intervals + receipts + dataGaps, doc retained blocked so it can't re-enroll).
+- **Tamper signal**: the agent reports known keep-awake/jiggler processes; the server
+  raises a `tamper` flag (Decision #51). Defends against standard users only (below).
 - **Both org-key and the manifest can be compromised at the edge**, so: the org key
   is **rotatable** (an array of active keys with expiry); a **blocked device is
   refused at `/enroll`**; and the **manifest is signed** (verified before the agent
@@ -236,16 +258,38 @@ with the game's process name. AFK-in-game (no input, no media) → `idle`. Hones
 > timestamps are stored in **UTC**.
 
 - **devices**: `{ _id: deviceId, pcName, hostname, osUsername, timezone, employeeId?,
-  agentVersion, os, liveness, flags, lastSeenAt, lastSampleUtc, helperRunning,
-  helperStartedAtUtc, clockOffsetMs?, lastDropped?, enrolledAt, blocked: bool,
-  archived: bool, machineHints: { machineGuid }, config }`
-  - **State = liveness + flags** (Decision #39, server-owned). `liveness`: `pending`
-    (enrolled, no intervals yet) → `online`/`offline` (driven by `lastSeenAt` vs
-    `heartbeatIntervalSec × 3`). Independent `flags` (any combination): `outdated`
-    (< `minSupportedVersion`), `clock_skewed`, `revoked`, `archived`,
-    `health_warning` (cpu > 5% sustained or mem > 200 MB), `possible_clone`. The
-    dashboard reads `liveness` for the badge and renders `flags` as chips — it never
-    re-derives them from `lastSeenAt`/`revokedAt` separately.
+  agentVersion, os, configSchemaVersion, liveness, flags, lastSeenAt, lastSampleUtc,
+  captureEnabled, helperRunning, helperStartedAtUtc, machineGuidHistory: [],
+  clockOffsetMs?, lastDropped?, enrolledAt, blocked: bool, archived: bool,
+  machineHints: { machineGuid }, config }`
+  - **State = liveness + flags** (Decision #39, server-owned, **derived from the
+    stored inputs**). The **source of truth** is the booleans/fields `blocked`,
+    `archived`, `lastSeenAt`, `deviceTokens.revokedAt`, `agentVersion`,
+    `configSchemaVersion`, `clockOffsetMs`, `machineGuidHistory`, health samples. The
+    server computes `liveness` + `flags` from them and stores the result denormalized
+    — written **only** through one `updateDeviceState(deviceId, …)` helper, in a single
+    atomic document update, so the two can never disagree (a revoke sets `blocked` +
+    pushes `revoked` + sets `revokedAt` together). The dashboard reads `liveness`/`flags`
+    and **never re-derives**.
+  - `liveness`: `pending` (enrolled, not yet seen) → `online`/`offline`
+    (`lastSeenAt` vs `heartbeatIntervalSec × 3`).
+  - **Flag triggers & clear/co-existence** (orthogonal — any combination; `revoked`
+    then `archived` take dashboard-badge precedence over `liveness`):
+
+    | flag | set when | cleared when | terminal? |
+    |------|----------|--------------|-----------|
+    | `outdated` | `agentVersion < minSupportedVersion` | agent updates (next heartbeat) | no |
+    | `clock_skewed` | `|clockOffsetMs| > 1 h` for 2 heartbeats | `< 30 min` for 2 heartbeats | no |
+    | `health_warning` | `cpuPct > 5` for 3 consecutive heartbeats **or** `memMb > 200` once | condition normal for 2 heartbeats | no |
+    | `config_mismatch` | agent `configSchemaVersion` < server's | agent catches up | no |
+    | `tamper` | heartbeat reports `tamperHints` (keep-awake/jiggler) | no hint for 2 heartbeats | no |
+    | `possible_clone` | ≥2 distinct **non-null** `machineGuid`s in `machineGuidHistory` | admin "dismiss clone" (audit-logged) | sticky until dismissed |
+    | `revoked` | admin revoke (`revokedAt`) | admin un-revoke (→ sticky `reauthorized`) | until un-revoked |
+    | `archived` | admin archive (`archived:true`) | admin un-archive (→ `reauthorized`) | until un-archived |
+
+    `liveness` is independent of every flag. `revoked` + `archived` may co-exist
+    (`revoked` wins the badge). Non-terminal badges (`outdated`/`clock_skewed`/
+    `health_warning`/`config_mismatch`/`tamper`/`possible_clone`) may stack freely.
 - **intervals**: `{ _id, deviceId, employeeId, sessionId, startUtc, endUtc,
   durationSec, state, appName, processName, windowTitle, browser?, domain?,
   pageTitle?, urlCaptureMethod, osUsername, category, batchId, receivedAt }`
@@ -259,11 +303,15 @@ with the game's process name. AFK-in-game (no input, no media) → `idle`. Hones
     `batches`, never here, or every multi-interval batch would be rejected),
     `{ domain }`, `{ category }`.
 - **batches** (receipt; Decision #28): `{ _id: batchId, deviceId, accepted,
-  receivedAt }`, **unique on `{ deviceId, batchId }`** (the dedup serialization
-  point), **TTL index on `receivedAt` (~180 d)** so it can't grow unbounded; a
-  receipt can't outlive the agent's max buffer hold anyway. Ingest checks this first;
+  receivedAt, expireAt }`. **`_id = batchId`** is the dedup key (a UUIDv4 is globally
+  unique — no compound unique index needed); a non-unique `{ deviceId, receivedAt }`
+  index serves purge queries. **TTL on `expireAt`**, where `expireAt = receivedAt +
+  batchReceiptDays` and `batchReceiptDays = max(180, maxBufferCapDays + 45)` — the
+  receipt window **must outlive the fleet's max buffer hold**, or a long-offline /
+  crash-corrupted agent could replay a batch whose receipt expired and duplicate data
+  (the `intervals` index is non-unique and wouldn't stop it). Ingest checks this first;
   ordinary interval delete **never** touches receipts (no stale-replay resurrection),
-  but the **"forget device"** admin action deletes intervals **and** receipts.
+  but the **block-&-wipe** admin action deletes intervals, receipts **and** dataGaps.
 - **categories**: `{ _id, pattern, matchType: 'exact'|'domain'|'process',
   priority, category: 'productive'|'unproductive'|'neutral', updatedBy, updatedAt }`
   - **Precedence** (deterministic): `exact` > `domain` > `process`, then higher
@@ -281,15 +329,21 @@ with the game's process name. AFK-in-game (no input, no media) → `idle`. Hones
     revoked keys pruned ~90 d after revocation.
   - `agentDefaults: { sampleIntervalSec, idleThresholdSec, … }`
   - `rateLimits: { ingestPerDevice, heartbeatPerDevice, enrollPerIp, enrollAllowlistCidrs: [] }`
-  - `retention: { intervalDays: null, batchReceiptDays: 180, screenshotDays: 7 }`
+  - `retention: { intervalDays: null, batchReceiptDays, screenshotDays: 7 }` —
+    `batchReceiptDays = max(180, maxBufferCapDays + 45)` (must exceed the fleet's max
+    `bufferCapDays`; see batches TTL).
+  - `contractDeprecation: { [contractMajor]: "warn" | "reject" }` — drives the
+    heartbeat `contractDeprecated` flag; never set for the current major.
   - `orgTimeZone: "Asia/Dhaka"` — **validated against the IANA db** before save;
     changes are audit-logged + stamped `orgTimeZoneChangedAt` and affect future
     bucketing only.
 - **auditLog**: `{ _id, adminId, action, target, before?, after?, atUtc }` — every
-  destructive/rules-changing admin action (revoke, archive, delete, category edit,
-  device→employee remap, `orgTimeZone` change). Infra + write helper land in **Phase
-  0** (the mapping action ships then); the viewer is Phase 4. `adminId` = the
-  Cloudflare-Access email until Phase 4 NextAuth assigns a stable UUID.
+  destructive/rules-changing admin action (revoke/un-revoke, archive/un-archive,
+  **block & wipe**, dismiss-clone, delete, category edit, device→employee remap,
+  `orgTimeZone` change). Written **before** any destructive step (so a wipe is
+  auditable after the data is gone). Infra + write helper land in **Phase 0** (the
+  mapping action ships then); the viewer is Phase 4. `adminId` = the Cloudflare-Access
+  email until Phase 4 NextAuth assigns a stable UUID.
 
 Categorization and `employeeId` are resolved at ingest (stored for fast queries)
 **and** bulk-re-resolvable when rules/mappings change (no re-ingest needed).
@@ -358,3 +412,9 @@ Deferred: alerts, departments/org chart, PDF/CSV export.
 - First install is a manual MSI walk to ~100 PCs (IT pre-trusts the signing cert via
   GPO on AD machines, or PowerShell/MSI custom action on workgroup PCs); every update
   after is remote.
+- **One signing cert signs both the service and the helper** for the whole v1 fleet
+  (the service's pipe peer-check verifies the helper against that cert — §2.2). If the
+  cert is ever rotated (leak/expiry/OV upgrade), the rotation must ship **as an agent
+  auto-update that bundles the new public key and accepts both the old and new
+  signatures during a transition window**, or a staggered rollout would have new
+  services rejecting old helpers (and vice-versa).

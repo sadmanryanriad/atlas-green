@@ -49,9 +49,13 @@ pipe end-to-end before building real features.
 - [ ] **C** Device → employee mapping stub (assign a name to a device).
 - [ ] **C** **Dev org key + secrets**: seed script creates one dev org key; the agent
       reads it from an env var / local dev config (never committed).
-- [ ] **C** **Dev seed script** (fixed-seed: 3 devices, one with 24 h of intervals —
+- [ ] **C** **Dev seed script** (fixed-seed). Intervals: one device with 24 h —
       all 3 states, 5+ domains incl. `null`, an interval crossing the Dhaka 18:00-UTC
-      midnight, one >4 h, one <10 s) so the dashboard is built against real shapes.
+      midnight, one >4 h, one <10 s. **Device state matrix** so the dashboard is built
+      against the full liveness+flags space: `pending`; `online+[]`; `offline`; and one
+      each of `online+[outdated]`, `[clock_skewed]`, `[revoked]`, `[archived]`,
+      `[health_warning]`, `[possible_clone]`, `[tamper]` (the revoked & archived ones
+      also carry intervals, to exercise the paused-but-has-history UX).
 - [ ] **A+C** Test scaffolding wired **with one real smoke test each** (`[Fact]` /
       `it()` that runs and passes — "0 tests" is not a green toolchain).
 - [ ] **M** READMEs updated with "how to run in dev" for both repos.
@@ -90,12 +94,23 @@ basic intervals while 1b is in progress.
 
 **1a exit gate:** the helper launches into a real user session (verified non-admin),
 relaunches on a fast user switch, and foreground samples reach the service over the
-verified pipe — visible in logs. *(Phase 2 may now begin in parallel.)*
+verified pipe — visible in logs. *(Phase 2's **server-side** work — `/ingest`, the
+`batches` collection + atomic txn, rate limits, org-key rotation, the liveness+flags
+state machine — may now begin in parallel against a test harness. Phase 2's
+**agent-side** work — SQLite buffer, sync loop, dropped-byState, token-loss recovery —
+starts after **1b**, since it's only testable against the aggregator's real
+intervals.)* The prod pipe **signature** check needs the Phase 5/6 cert; in dev it's
+skipped behind a flag (image-path check only) — see ARCHITECTURE §2.2.
 
 ### Phase 1b — State machine + aggregator
 
-- [ ] **A** **Idle** via `GetLastInputInfo`: enter `idle` after **300 s continuous
-      no-input** (any input resets the timer); **leave on any input**.
+- [ ] **A** **Idle** via `GetLastInputInfo`: enter `idle` after **300 s with no
+      meaningful input**; only a **meaningful input quantum** (≥~2 s sustained or ≥3
+      events / 10 s; mouse-move < 4 px ignored) resets the timer / **leaves idle** — a
+      single isolated event (jiggle, poll) does not.
+- [ ] **A** **Tamper detection**: flag known keep-awake/jiggler processes (Caffeine,
+      PowerToys Awake, mouse-jiggler utils, obvious `SendKeys` loops) → `tamperHints`
+      on the heartbeat (server raises the `tamper` flag).
 - [ ] **A** **Media** via **GSMTC** (Playing?) → `passive_media`; **gated WASAPI
       fallback** (recent ≤60 s non-comms GSMTC source); **an active comms call always
       overrides** (calls are never `passive_media`); media transitions bypass hysteresis.
@@ -107,8 +122,10 @@ verified pipe — visible in logs. *(Phase 2 may now begin in parallel.)*
       **re-derive state from the first post-resume sample** (not hardcoded `idle`).
 - [ ] **A** **Graceful shutdown**: on `ApplicationStopping`, flush the open interval.
 - [ ] **A** **Unit tests** (pure logic): the **call-vs-media gating**, **idle
-      reset-on-input** (no oscillation), **bursty-input call stays active not idle**,
-      **sleep-resume with media auto-resume**, eTLD+1 normalization stub.
+      reset-on-meaningful-input** (no oscillation), **bursty-input call stays active**,
+      **isolated jiggle every 60 s → stays `idle`** (the keep-awake case),
+      **sleep-resume with media auto-resume**, **force-close splits to `idle` after the
+      last sample** (no phantom multi-hour `active`), eTLD+1 normalization stub.
 - [ ] **M** README: what's captured and how to watch it live in dev.
 
 **1b exit gate:** switching apps / playing a video / **being on a Teams call (with
@@ -125,15 +142,21 @@ and states (the call is `active`/`idle`, **never** `passive_media`); verified li
       machine scope**; no native dep), ACL-locked under `C:\ProgramData\...`.
 - [ ] **A** Append closed intervals; `synced` flag; buffer cap. A cap drop is **never
       silent**: log it + report `dropped {count, oldest, newest, byState}` (prefer
-      dropping `idle`); the server persists it as a `dataGap`. *(was Ph7)*
+      dropping `idle`); the server persists it as a `dataGap`. Also enforce a
+      **retention floor**: drop unsynced rows older than `min(bufferCapDays,
+      serverBatchesTtl)` (so a corrupted/long-offline buffer can't replay past an
+      evicted receipt). *(was Ph7)*
 - [ ] **A** **Sync loop** (5 min **±30 s jitter**): gzip batch with a **UUID
       `batchId`** → `/ingest`; **ACK before purge** (verify response `batchId`). The
       agent **self-splits before send** when over the size cap (fresh UUID per
       sub-batch, recursive halving), spacing sub-batches per the rate limit.
 - [ ] **A** Exponential backoff **+ jitter**; offline accumulation; honor `Retry-After`.
 - [ ] **A** **Config validation**: clamp/ignore out-of-range server config values.
-- [ ] **A** **Token-loss recovery**: lost DPAPI token → re-enroll **rotates** (new
-      token); buffered rows then sync under it.
+- [ ] **A** **Token-loss recovery**: re-enroll sends `Authorization` iff a token still
+      exists (→ no-op); a lost token → re-enroll **rotates** (new token), buffered rows
+      then sync. Re-enrolls are **sequential** + capped (~5/h). On a sticky
+      `reauthorized`, **resume `/ingest` on the existing token first**, re-enroll only
+      if that 401s; a `401` on `/enroll` (bad org key) ≠ a `403` (blocked) — don't pause.
 - [ ] **C** `/api/v1/ingest` per contract: validate token **(bound to deviceId)**,
       **atomic per batch** (one txn, ≤1000 intervals, `maxCommitTimeMS`, retry on
       `TransientTransactionError`), write the **`batches` receipt**, resolve
@@ -141,18 +164,25 @@ and states (the call is `active`/`idle`, **never** `passive_media`); verified li
 - [ ] **C** Collections + indexes: `intervals` `{deviceId,batchId}` **NON-unique**,
       `{employeeId,startUtc}`; **`batches` unique `{deviceId,batchId}` + TTL on
       `receivedAt`**; `deviceTokens.tokenHash` unique. *(unique-index bug fixed — r2)*
-- [ ] **C** **Device state = liveness + flags** (server side), driven by heartbeat +
-      admin actions; `/heartbeat` **accepts a revoked token** (→ `flags:[revoked]`).
+- [ ] **C** **Device state = liveness + flags** (server side), derived from stored
+      inputs through one **`updateDeviceState`** path (no second source of truth);
+      `/heartbeat` **accepts a revoked/archived token** (→ `flags:[revoked]`/`[archived]`)
+      but **freezes capture-health** from a revoked/archived heartbeat; `reauthorized`
+      is **sticky** until the agent acts.
 - [ ] **C** **Rate limiting** per device/IP; `/enroll` = 10/min/IP with a
       **corp-CIDR allowlist** so the rollout isn't throttled.
-- [ ] **C** **Org-key array + rotation** in `settings`; **blocked device → `403`** at
-      `/enroll` (org-key checked first); **"forget device"** action deletes intervals
-      **and** receipts. *(was Ph7)*
+- [ ] **C** **Org-key array + rotation** in `settings`; **blocked/revoked/archived
+      device → `403`** at `/enroll` (org-key checked first). Three admin actions:
+      **revoke**, **archive** (reversible, ingest-blocked, keeps history),
+      **`POST /admin/devices/:id/wipe`** (block & wipe — deletes intervals + receipts
+      **+ dataGaps**, doc retained blocked, irreversible). *(was Ph7)*
 - [ ] **A** Unit tests for batching / retry / purge-after-ack.
 - [ ] **C** Integration tests: batch of N stored once; **partial-insert-then-retry**
       never loses/duplicates; stale replay of an admin-deleted batch is rejected;
-      **end-to-end revocation** (revoke → `/ingest` 401, `/enroll` 403, `/heartbeat`
-      200 `revoked`, dashboard shows revoked). *(revocation E2E moved here from Ph7)*
+      **double-rotation race** (two rapid token-loss re-enrolls → same token, one row
+      superseded); **end-to-end revocation** (revoke → `/ingest` 401, `/enroll` 403,
+      `/heartbeat` 200 `revoked` with frozen capture, dashboard shows revoked) **and
+      archive** (un-archive → resume). *(revocation E2E moved here from Ph7)*
 
 **Exit gate:** intervals captured offline flush to MongoDB when connectivity
 returns; retried/partial/stale batches never double-store or resurrect data; a
@@ -207,8 +237,14 @@ supported browsers all yield correct normalized `domain` + `pageTitle` intervals
 - [ ] **C** **Audit-log viewer** (infra shipped in Phase 0). A **device→employee
       remap** updates **future** intervals; a **separate bulk-reassign** action
       re-resolves a historical range (audit-logged). `osUsername` is never back-filled.
-- [ ] **C** Dashboard reads device **liveness + flags** (not derived fields); flags a
-      device showing **≥2 distinct `osUsername`s** in 24 h (possible mis-map).
+- [ ] **C** Dashboard reads device **liveness + flags** (not re-derived); `revoked`/
+      `archived` override the badge; **capture panel muted when `capture.enabled:false`**;
+      a **flag filter** on the company overview (chip per flag); a **"dismiss clone"**
+      action (audit-logged). Flags a device showing **≥2 distinct `osUsername`s** in
+      24 h (possible mis-map).
+- [ ] **C** **`dataGaps` surfaced** on the timeline (a greyed band "N intervals
+      dropped" on the detection day) + a fleet count of devices with recent gaps —
+      so a buffer-overflow gap isn't write-only storage.
 - [ ] **C** Upgrade admin auth to **NextAuth** (per-admin accounts/roles) on top of
       Cloudflare Access.
 - [ ] **C** Component/integration tests, incl. a **clock-skewed device buckets into
